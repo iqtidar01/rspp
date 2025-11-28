@@ -4,9 +4,16 @@
 
 When deploying to Render, you may encounter `ETIMEDOUT` errors when sending emails. This is because:
 
-1. **Port 465 (SSL) is often blocked** on cloud platforms like Render
-2. **SMTP servers may block connections** from cloud provider IP addresses
+1. **SiteGround blocks cloud IPs**: SiteGround (and many shared hosting providers) actively block SMTP connections from cloud platform IP addresses (Render, Heroku, AWS, etc.) as a spam prevention measure
+2. **Port 465 (SSL) is often blocked** on cloud platforms like Render
 3. **Network restrictions** on outbound connections
+
+### ⚠️ Important: SiteGround May Not Work on Render
+
+Even with correct settings (`SMTP_PORT=587`, `SMTP_SECURE=false`), SiteGround SMTP may still fail because:
+- SiteGround blocks connections from cloud provider IP ranges
+- This is a security measure that cannot be easily bypassed
+- **Recommendation**: Use a cloud-friendly email service (see below)
 
 ## Solution: Use Port 587 (TLS) for Render
 
@@ -65,19 +72,25 @@ The backend now includes automatic retry logic that will:
 
 #### Still Getting Timeout Errors?
 
-1. **Verify Environment Variables:**
+**Most Likely Cause**: SiteGround is blocking connections from Render's IP addresses.
+
+**Solutions** (in order of recommendation):
+
+1. **Use a Cloud-Friendly Email Service** (Recommended):
+   - **SendGrid**: Free tier (100 emails/day), easy setup
+   - **Mailgun**: Free tier (5,000 emails/month)
+   - **AWS SES**: Very affordable ($0.10 per 1,000 emails)
+   - See `ALTERNATIVE-EMAIL-SERVICES.md` for detailed setup instructions
+
+2. **Contact SiteGround Support**:
+   - Request to whitelist Render's IP addresses
+   - May require upgrading to a higher plan
+   - Not guaranteed to work
+
+3. **Verify Environment Variables** (if trying SiteGround):
    - Check that all SMTP variables are set correctly in Render dashboard
    - Ensure `SMTP_PORT=587` and `SMTP_SECURE=false`
-
-2. **Check SiteGround Settings:**
-   - Verify your SiteGround email account is active
-   - Confirm SMTP is enabled for your email account
-   - Check if SiteGround allows connections from external IPs
-
-3. **Alternative: Use a Cloud-Friendly Email Service:**
-   - Consider using SendGrid, Mailgun, or AWS SES
-   - These services are designed for cloud deployments
-   - Better reliability and deliverability
+   - Verify credentials are correct
 
 #### Error: "535 Incorrect authentication data"
 
