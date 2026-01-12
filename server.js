@@ -122,29 +122,62 @@ const transporter = nodemailer.createTransport({
   },
   // Encourage STARTTLS on 587
   requireTLS: SMTP_PORT === 587,
-  connectionTimeout: 20000,
-  greetingTimeout: 20000,
-  socketTimeout: 20000,
+  // Increased timeouts to handle slow connections
+  connectionTimeout: 30000, // 30 seconds
+  greetingTimeout: 30000, // 30 seconds
+  socketTimeout: 60000, // 60 seconds for socket operations
+  // Additional options for better connection handling
+  pool: false, // Disable connection pooling for simpler debugging
+  maxConnections: 1,
+  maxMessages: 1,
 });
 
 async function verifySMTPConnection() {
   try {
     await transporter.verify();
     console.log("✅ SMTP server connection verified");
-    return true;
+    return { success: true };
   } catch (error) {
-    return false;
+    console.error("❌ SMTP verification failed:", {
+      code: error.code,
+      command: error.command,
+      message: error.message,
+      response: error.response,
+      responseCode: error.responseCode,
+    });
+    return { 
+      success: false, 
+      error: {
+        code: error.code,
+        message: error.message,
+        responseCode: error.responseCode,
+      }
+    };
   }
 }
 
 async function sendEmail({ to, subject, html }) {
   // Uses authenticated mailbox as sender
-  await transporter.sendMail({
-    from: SMTP_EMAIL,
-    to,
-    subject,
-    html,
-  });
+  try {
+    const info = await transporter.sendMail({
+      from: SMTP_EMAIL,
+      to,
+      subject,
+      html,
+    });
+    console.log("✅ Email sent successfully:", info.messageId);
+    return info;
+  } catch (error) {
+    console.error("❌ Email send failed:", {
+      code: error.code,
+      command: error.command,
+      message: error.message,
+      response: error.response,
+      responseCode: error.responseCode,
+      stack: error.stack,
+    });
+    throw error; // Re-throw to be handled by caller
+  }
 }
 
 // ---------- Power BI (Service Principal) ----------
@@ -234,26 +267,60 @@ async function getEmbedToken(
     reports: [{ id: reportId }],
   };
 
-  if (userIdentity && userIdentity.username) {
-    const rlsDatasets = datasetIds.filter((id) =>
-      RLS_ENABLED_DATASETS.includes(id)
-    );
-    
-    if (rlsDatasets.length > 0) {
-      const roles =
-        userIdentity.roles && userIdentity.roles.length > 0
-          ? userIdentity.roles
-          : [RLS_ROLE_NAME];
+  // Check if any datasets require RLS (effective identity)
+  const rlsDatasets = datasetIds.filter((id) =>
+    RLS_ENABLED_DATASETS.includes(id)
+  );
 
-      body.identities = [
-        {
-          username: userIdentity.username,
-          roles,
-          datasets: rlsDatasets,
-        },
-      ];
+  // If RLS-enabled datasets are present, we MUST provide an effective identity
+  if (rlsDatasets.length > 0) {
+    // Validate that we have userIdentity with username
+    if (!userIdentity || !userIdentity.username) {
+      const errorMsg = `Dataset(s) ${rlsDatasets.join(", ")} require effective identity. ` +
+        `Please provide userIdentity with username. ` +
+        `Current userIdentity: ${JSON.stringify(userIdentity || "null")}`;
+      console.error("❌ RLS identity validation failed:", {
+        rlsDatasets,
+        userIdentity: userIdentity || "null",
+        hasUsername: !!userIdentity?.username,
+      });
+      throw new Error(errorMsg);
     }
+
+    // Use provided roles or default to RLS_ROLE_NAME
+    const roles =
+      userIdentity.roles && userIdentity.roles.length > 0
+        ? userIdentity.roles
+        : [RLS_ROLE_NAME];
+
+    // Always add identities for RLS-enabled datasets
+    // Power BI requires this exact structure
+    body.identities = [
+      {
+        username: userIdentity.username,
+        roles: roles,
+        datasets: rlsDatasets,
+      },
+    ];
+
+    console.log("🔒 Adding RLS identity to request body:", {
+      username: userIdentity.username,
+      roles: roles,
+      datasets: rlsDatasets,
+      identityStructure: body.identities[0],
+    });
+  } else if (userIdentity && userIdentity.username) {
+    // Optional: Add identity even for non-RLS datasets if provided
+    // This can be useful for future RLS enablement
+    console.log("ℹ️  User identity provided but no RLS-enabled datasets");
   }
+
+  // Log the complete request body before sending to Power BI
+  console.log("📤 Request body to Power BI API:", JSON.stringify({
+    datasets: body.datasets,
+    reports: body.reports,
+    identities: body.identities || "none",
+  }, null, 2));
 
   try {
     const response = await axios.post(url, body, {
@@ -263,9 +330,28 @@ async function getEmbedToken(
       },
     });
     
+    console.log("✅ Embed token generated successfully");
     return response.data;
   } catch (error) {
     const msg = error.response?.data?.error?.message || error.message;
+    const errorDetails = error.response?.data?.error || {};
+    
+    console.error("❌ Embed token generation failed:", {
+      error: msg,
+      errorCode: errorDetails.code,
+      errorDetails: errorDetails,
+      requestBody: {
+        datasets: body.datasets,
+        reports: body.reports,
+        hasIdentities: !!body.identities,
+        identities: body.identities,
+      },
+      datasets: datasetIds,
+      rlsDatasets,
+      hasUserIdentity: !!userIdentity,
+      username: userIdentity?.username,
+    });
+    
     throw new Error(`Failed to generate embed token: ${msg}`);
   }
 }
@@ -307,6 +393,74 @@ app.get("/api/test-smtp", async (_req, res) => {
       });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Test SMTP connection endpoint
+app.get("/api/test-smtp", async (req, res) => {
+  try {
+    console.log("🔍 Testing SMTP connection...");
+    console.log(`   Host: ${SMTP_HOST}`);
+    console.log(`   Port: ${SMTP_PORT}`);
+    console.log(`   Secure: ${SMTP_SECURE}`);
+    console.log(`   Email: ${SMTP_EMAIL}`);
+    console.log(`   Password: ${SMTP_PASSWORD ? "***" + SMTP_PASSWORD.slice(-3) : "NOT SET"}`);
+
+    if (!SMTP_HOST || !SMTP_EMAIL || !SMTP_PASSWORD) {
+      return res.status(400).json({
+        success: false,
+        error: "SMTP configuration incomplete",
+        details: {
+          SMTP_HOST: SMTP_HOST ? "✅ Set" : "❌ Missing",
+          SMTP_PORT: SMTP_PORT ? `✅ ${SMTP_PORT}` : "❌ Missing",
+          SMTP_EMAIL: SMTP_EMAIL ? "✅ Set" : "❌ Missing",
+          SMTP_PASSWORD: SMTP_PASSWORD ? "✅ Set" : "❌ Missing",
+        },
+      });
+    }
+
+    const result = await verifySMTPConnection();
+    
+    if (result.success) {
+      res.json({
+        success: true,
+        message: "SMTP connection verified successfully",
+        config: {
+          host: SMTP_HOST,
+          port: SMTP_PORT,
+          secure: SMTP_SECURE,
+          email: SMTP_EMAIL,
+        },
+      });
+    } else {
+      res.status(503).json({
+        success: false,
+        error: "SMTP connection verification failed",
+        details: result.error,
+        config: {
+          host: SMTP_HOST,
+          port: SMTP_PORT,
+          secure: SMTP_SECURE,
+          email: SMTP_EMAIL,
+        },
+        troubleshooting: {
+          "Check network": "Verify your server can reach the SMTP host",
+          "Check firewall": `Ensure port ${SMTP_PORT} is not blocked`,
+          "Verify credentials": "Double-check SMTP_EMAIL and SMTP_PASSWORD",
+          "Try different port": SMTP_PORT === 465 ? "Try port 587 with SMTP_SECURE=false" : "Try port 465 with SMTP_SECURE=true",
+        },
+      });
+    }
+  } catch (err) {
+    console.error("❌ SMTP test error:", err);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Failed to test SMTP connection",
+      details: {
+        code: err.code,
+        message: err.message,
+      },
+    });
   }
 });
 
@@ -353,6 +507,18 @@ app.post("/api/send-otp", async (req, res) => {
 
     res.json({ success: true, message: "OTP sent to email" });
   } catch (err) {
+    // Log detailed error for debugging
+    console.error("❌ OTP send error:", {
+      code: err.code,
+      command: err.command,
+      message: err.message,
+      response: err.response,
+      responseCode: err.responseCode,
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+    });
+
     // Map common Nodemailer errors to friendly messages
     let statusCode = 500;
     let errorMessage = err.message || "Failed to send email";
@@ -366,13 +532,24 @@ app.post("/api/send-otp", async (req, res) => {
       errorMessage =
         "SMTP authentication failed (535). Verify SMTP_EMAIL/SMTP_PASSWORD and remove any quotes in env.";
     } else if (err.code === "ECONNECTION") {
+      statusCode = 503;
       errorMessage =
-        "Could not connect to SMTP server. Check SMTP_HOST/SMTP_PORT.";
+        `Could not connect to SMTP server (${SMTP_HOST}:${SMTP_PORT}). Check SMTP_HOST/SMTP_PORT and network connectivity.`;
     } else if (err.code === "ETIMEDOUT" || /timed out/i.test(err.message)) {
+      statusCode = 504;
       errorMessage =
-        "SMTP connection timed out. Check network and SMTP settings.";
+        `SMTP connection timed out after 30-60 seconds. Check network connectivity, firewall settings, and verify SMTP_HOST (${SMTP_HOST}) and SMTP_PORT (${SMTP_PORT}) are correct.`;
+    } else if (err.code === "ESOCKET" || err.code === "ETIMEDOUT") {
+      statusCode = 504;
+      errorMessage =
+        `SMTP socket error. The server at ${SMTP_HOST}:${SMTP_PORT} may be unreachable or blocked by firewall.`;
     } else if (err.code === "EENVELOPE") {
+      statusCode = 400;
       errorMessage = "Invalid email address format.";
+    } else if (err.code === "ECERT") {
+      statusCode = 503;
+      errorMessage =
+        "SMTP SSL/TLS certificate error. Check SMTP_SECURE setting and server certificate.";
     }
 
     res.status(statusCode).json({ success: false, error: errorMessage });
@@ -744,10 +921,51 @@ app.post("/api/reports", async (req, res) => {
 app.post("/api/embed-token", async (req, res) => {
   try {
     const { reportId, datasetId, userIdentity, bypassRLS } = req.body;
+    
+    // Log incoming request for debugging
+    console.log("📥 Embed token request:", {
+      reportId,
+      datasetId,
+      hasUserIdentity: !!userIdentity,
+      username: userIdentity?.username,
+      roles: userIdentity?.roles,
+      bypassRLS,
+    });
+    
     if (!reportId || !datasetId) {
       return res
         .status(400)
         .json({ success: false, error: "reportId and datasetId are required" });
+    }
+    
+    // Check if dataset requires RLS
+    const requiresRLS = RLS_ENABLED_DATASETS.includes(datasetId);
+    console.log("🔍 Dataset RLS check:", {
+      datasetId,
+      requiresRLS,
+      rlsEnabledDatasets: RLS_ENABLED_DATASETS,
+    });
+    
+    // If dataset requires RLS, we cannot bypass it - we need userIdentity
+    if (requiresRLS) {
+      // Force bypassRLS to false for RLS-enabled datasets
+      const effectiveBypassRLS = false;
+      
+      if (!userIdentity || !userIdentity.username) {
+        console.error("❌ Missing userIdentity for RLS-enabled dataset:", {
+          datasetId,
+          userIdentity: userIdentity || "null",
+        });
+        return res.status(400).json({
+          success: false,
+          error: `Dataset ${datasetId} requires effective identity. Please provide userIdentity with username. Current userIdentity: ${JSON.stringify(userIdentity || "null")}`,
+        });
+      }
+      
+      console.log("✅ RLS enabled - will use identity:", {
+        username: userIdentity.username,
+        roles: userIdentity.roles || [RLS_ROLE_NAME],
+      });
     }
     
     // Get access token for Power BI API
@@ -763,12 +981,27 @@ app.post("/api/embed-token", async (req, res) => {
         .json({ success: false, error: "Report not found" });
     }
     
+    // Determine what to pass to getEmbedToken
+    // For RLS-enabled datasets, always pass userIdentity (ignore bypassRLS)
+    // For non-RLS datasets, respect bypassRLS flag
+    const identityToPass = requiresRLS 
+      ? userIdentity  // Always use identity for RLS datasets
+      : (bypassRLS ? null : userIdentity);  // Respect bypassRLS for non-RLS
+    
+    console.log("🔑 Calling getEmbedToken with:", {
+      reportId,
+      datasetId,
+      requiresRLS,
+      willPassIdentity: !!identityToPass,
+      username: identityToPass?.username,
+    });
+    
     // Generate embed token
     const token = await getEmbedToken(
       accessToken,
       reportId,
       [datasetId],
-      bypassRLS ? null : userIdentity
+      identityToPass
     );
 
     // Return complete embed configuration
@@ -781,9 +1014,11 @@ app.post("/api/embed-token", async (req, res) => {
       tokenExpiry: token.expiration,
       expiration: token.expiration,  // Backward compatibility
       tokenId: token.tokenId,
-      rlsBypassed: !!bypassRLS,
+      rlsBypassed: bypassRLS && !requiresRLS,
+      rlsEnabled: requiresRLS,
     });
   } catch (error) {
+    console.error("❌ Embed token endpoint error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -792,13 +1027,27 @@ app.post("/api/embed-config/:reportId", async (req, res) => {
   try {
     const { reportId } = req.params;
     const { userIdentity } = req.body;
+    
+    // Check if dataset requires RLS
     const accessToken = await getAccessToken();
     const reports = await getReportsInWorkspace(accessToken);
     const report = reports.find((r) => r.id === reportId);
-    if (!report)
+    
+    if (!report) {
       return res
         .status(404)
         .json({ success: false, error: "Report not found" });
+    }
+
+    const requiresRLS = RLS_ENABLED_DATASETS.includes(report.datasetId);
+    
+    // If dataset requires RLS, we need userIdentity
+    if (requiresRLS && (!userIdentity || !userIdentity.username)) {
+      return res.status(400).json({
+        success: false,
+        error: `Dataset ${report.datasetId} requires effective identity. Please provide userIdentity with username.`,
+      });
+    }
 
     const token = await getEmbedToken(
       accessToken,
@@ -817,8 +1066,10 @@ app.post("/api/embed-config/:reportId", async (req, res) => {
       tokenId: token.tokenId,
       expiration: token.expiration,
       tokenExpiry: token.expiration,
+      rlsEnabled: requiresRLS,
     });
   } catch (error) {
+    console.error("❌ Embed config endpoint error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -905,10 +1156,36 @@ async function startServer() {
     initializeCsvFile();
     console.log("📄 CSV email storage initialized");
     
-    // Non-blocking SMTP verify
-    verifySMTPConnection().catch(() => {
-      // SMTP verification failed
-    });
+    // Non-blocking SMTP verify with detailed logging
+    if (SMTP_HOST && SMTP_EMAIL && SMTP_PASSWORD) {
+      console.log("🔍 Verifying SMTP connection...");
+      console.log(`   Host: ${SMTP_HOST}`);
+      console.log(`   Port: ${SMTP_PORT}`);
+      console.log(`   Secure: ${SMTP_SECURE}`);
+      console.log(`   Email: ${SMTP_EMAIL}`);
+      console.log(`   Password: ${SMTP_PASSWORD ? "***" + SMTP_PASSWORD.slice(-3) : "NOT SET"}`);
+      
+      verifySMTPConnection()
+        .then((result) => {
+          if (result.success) {
+            console.log("✅ SMTP server connection verified successfully");
+          } else {
+            console.warn("⚠️  SMTP server connection verification failed");
+            console.warn(`   Error: ${result.error?.message || "Unknown error"}`);
+            console.warn(`   Code: ${result.error?.code || "N/A"}`);
+            console.warn("   Email sending may not work. Check your SMTP configuration.");
+          }
+        })
+        .catch((err) => {
+          console.error("❌ SMTP verification error:", err.message);
+          console.error("   Email sending may not work. Check your SMTP configuration.");
+        });
+    } else {
+      console.warn("⚠️  SMTP configuration incomplete - email features will not work");
+      console.warn(`   SMTP_HOST: ${SMTP_HOST ? "✅" : "❌ Missing"}`);
+      console.warn(`   SMTP_EMAIL: ${SMTP_EMAIL ? "✅" : "❌ Missing"}`);
+      console.warn(`   SMTP_PASSWORD: ${SMTP_PASSWORD ? "✅" : "❌ Missing"}`);
+    }
 
     app.listen(PORT, () => {
       console.log(`🚀 API running on http://localhost:${PORT}`);
